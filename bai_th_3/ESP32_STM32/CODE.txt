@@ -1,0 +1,170 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <string.h>
+#include <WiFi.h>
+#include <esp_now.h>
+
+#define LED_PIN 2
+#define UART_RX_PIN 16
+#define UART_TX_PIN 17
+#define BH1750_ADDR 0x23
+
+// --- GIAO THUC UART ---
+#define START_BYTE 0xAA
+#define END_BYTE   0x55
+#define CMD_TEXT   0x01
+#define CMD_ACK    0x02
+#define MAX_DATA   64
+
+typedef struct {
+  uint8_t start;
+  uint8_t cmd;
+  uint8_t len;
+  uint8_t data[MAX_DATA + 1];
+  uint8_t checksum;
+  uint8_t end;
+} Message_t;
+
+// --- GIAO THUC ESP-NOW ---
+typedef struct struct_message {
+    char id[20];
+    float temp;
+    float hum;
+    float pres;
+} struct_message;
+
+typedef struct Node1_Data {
+    char info[80];
+} Node1_Data;
+
+struct_message incomingBME280;
+Node1_Data outDataToNode3;
+
+esp_now_peer_info_t peerInfoNode3;
+bool isNode3Connected = false; // Co luu trang thai Auto-Pairing
+
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+    memcpy(&incomingBME280, incomingData, sizeof(incomingBME280));
+    Serial.print(">>> [ESP-NOW tu Node 3] T: "); 
+    Serial.print(incomingBME280.temp); Serial.print("C | H: "); 
+    Serial.print(incomingBME280.hum);  Serial.println("%");
+
+    // TU DONG LAY DIA CHI MAC CUA NODE 3 DE GUI NGUOC LAI
+    if (!isNode3Connected) {
+        memcpy(peerInfoNode3.peer_addr, mac, 6);
+        peerInfoNode3.channel = 0;
+        peerInfoNode3.encrypt = false;
+        if (esp_now_add_peer(&peerInfoNode3) == ESP_OK) {
+            isNode3Connected = true;
+            Serial.println("\n>> TU DONG KET NOI 2 CHIEU VOI NODE 3 THANH CONG!\n");
+        }
+    }
+}
+
+// --- CAM BIEN BH1750 ---
+void BH1750_Init() {
+  Wire.begin(); Wire.beginTransmission(BH1750_ADDR);
+  Wire.write(0x10); Wire.endTransmission(); delay(180);
+}
+
+uint16_t BH1750_ReadLux() {
+  uint16_t lux = 0;
+  Wire.requestFrom(BH1750_ADDR, 2);
+  if (Wire.available() >= 2) {
+    lux = (uint16_t)Wire.read() << 8;
+    lux |= Wire.read();
+    lux = (uint16_t)(lux / 1.2f);
+  }
+  return lux;
+}
+
+// --- LOGIC UART ---
+uint8_t MSG_Checksum(Message_t *msg) {
+  uint8_t cs = msg->cmd ^ msg->len;
+  for (int i = 0; i < msg->len; i++) cs ^= msg->data[i];
+  return cs;
+}
+
+void MSG_Build(Message_t *msg, uint8_t cmd, const char *data) {
+  msg->start = START_BYTE; msg->cmd = cmd;
+  msg->len = (uint8_t)strlen(data);
+  memcpy(msg->data, data, msg->len);
+  msg->checksum = MSG_Checksum(msg); msg->end = END_BYTE;
+}
+
+void MSG_Send_STM32(Message_t *msg) {
+  Serial2.write(msg->start); Serial2.write(msg->cmd); Serial2.write(msg->len);
+  for (int i = 0; i < msg->len; i++) Serial2.write(msg->data[i]);
+  Serial2.write(msg->checksum); Serial2.write(msg->end);
+}
+
+static uint8_t rx_buf[128]; static uint8_t rx_idx = 0;
+bool MSG_Receive_STM32(Message_t *out) {
+  while (Serial2.available()) {
+    uint8_t b = (uint8_t)Serial2.read();
+    if (rx_idx == 0 && b != START_BYTE) continue;
+    rx_buf[rx_idx++] = b;
+    if (rx_idx >= 3) {
+      uint8_t total = 3 + rx_buf[2] + 2;
+      if (rx_idx == total) {
+        out->start = rx_buf[0]; out->cmd = rx_buf[1]; out->len = rx_buf[2];
+        memcpy(out->data, &rx_buf[3], out->len); out->data[out->len] = 0;
+        out->checksum = rx_buf[3 + out->len]; out->end = rx_buf[3 + out->len + 1];
+        rx_idx = 0;
+        if (out->end == END_BYTE && out->checksum == MSG_Checksum(out)) return true;
+      }
+    }
+    if (rx_idx >= 128) rx_idx = 0;
+  }
+  return false;
+}
+
+unsigned long lastSend = 0;
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+  pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW);
+  BH1750_Init();
+  
+  WiFi.mode(WIFI_STA);
+  Serial.println("\nESP32 - NODE 1 - READY");
+  Serial.print("MAC: "); Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) return;
+  esp_now_register_recv_cb(OnDataRecv);
+}
+
+void loop() {
+  Message_t tx_msg, rx_msg;
+  
+  // Chu dong gui ban tin moi 2 giay
+  if (millis() - lastSend > 2000) {
+    uint16_t lux = BH1750_ReadLux();
+    char payload[80];
+    snprintf(payload, sizeof(payload), "Linh - DT177 - %d lux", lux);
+    
+    // 1. Gui cho STM32 qua UART
+    MSG_Build(&tx_msg, CMD_TEXT, payload);
+    MSG_Send_STM32(&tx_msg);
+    Serial.print("[TX->STM32] "); Serial.println(payload);
+
+    // 2. Gui dong thoi luon cho Node 3 qua ESP-NOW (Neu da Auto-Pair)
+    if (isNode3Connected) {
+        strcpy(outDataToNode3.info, payload);
+        esp_now_send(peerInfoNode3.peer_addr, (uint8_t *)&outDataToNode3, sizeof(outDataToNode3));
+    }
+    lastSend = millis();
+  }
+
+  // Nhan phan hoi tu STM32
+  if (MSG_Receive_STM32(&rx_msg)) {
+    if (rx_msg.cmd == CMD_TEXT) {
+      Serial.print("[RX<-STM32] "); Serial.println((char*)rx_msg.data);
+    }
+    else if (rx_msg.cmd == CMD_ACK) {
+      if (strcmp((char*)rx_msg.data, "LED_ON") == 0) digitalWrite(LED_PIN, HIGH);
+      else if (strcmp((char*)rx_msg.data, "LED_OFF") == 0) digitalWrite(LED_PIN, LOW);
+    }
+  }
+}

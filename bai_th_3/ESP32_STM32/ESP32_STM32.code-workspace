@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"name": "ESP_ESP_2",
+			"path": "../ESP32_T3/ESP_ESP_2"
+		}
+	],
+	"settings": {}
+}
